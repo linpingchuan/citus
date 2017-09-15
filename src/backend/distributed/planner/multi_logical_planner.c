@@ -102,6 +102,7 @@ static bool HasComplexJoinOrder(Query *queryTree);
 static bool HasComplexRangeTableType(Query *queryTree);
 static bool RelationInfoContainsReferenceTable(PlannerInfo *plannerInfo,
 											   RelOptInfo *relationInfo);
+static bool IsSubquerySupported(Query *subqueryTree);
 static void ValidateClauseList(List *clauseList);
 static void ValidateSubqueryPushdownClauseList(List *clauseList);
 static bool ExtractFromExpressionWalker(Node *node,
@@ -796,7 +797,7 @@ DeferErrorIfCannotPushdownSubquery(Query *subqueryTree, bool outerMostQueryHasLi
 		errorDetail = "Subqueries without relations are unsupported";
 	}
 
-	if (subqueryTree->hasWindowFuncs)
+	if (!IsSubquerySupported(subqueryTree))
 	{
 		preconditionsSatisfied = false;
 		errorDetail = "Window functions are currently unsupported";
@@ -920,6 +921,58 @@ DeferErrorIfCannotPushdownSubquery(Query *subqueryTree, bool outerMostQueryHasLi
 	}
 
 	return NULL;
+}
+
+
+/*
+ * This method is going to check if the window clause is a one we can support or not.
+ * Basically, we need to fetch the column oid used in window function (partition) from
+ * subqueryTree -> windowClause -> partitionClause -> tleSortGroupRef and check if it
+ * matches with the one in DistPartitionKey(subqueryTree -> rtable -> relid) -> oid
+ */
+static bool
+IsSubquerySupported(Query *subqueryTree)
+{
+	List *partitionClauses = NULL;
+	List *windowClauses = NULL;
+	List *rTable = NULL;
+	ListCell *partitionClause = NULL;
+	ListCell *windowClause = NULL;
+
+	rTable = subqueryTree -> rtable;
+
+	// TODO will fetch the oid of the rtable entry (assuming there is one table in from)
+	// and get the DistPartitionKey() of it.
+
+	// var key = DistPartitionKey()
+
+	windowClauses = subqueryTree -> windowClause;
+
+	foreach(windowClause, windowClauses)
+	{
+		partitionClauses = windowClause -> partitionClause;
+
+		char partitionIsFine = 0;
+		foreach(partitionClause, partitionClauses)
+		{
+			SortGroupClause *sortGroupClause = (partitionClause -> data).ptr_value;
+			index targetListIndex = sortGroupClause -> tleSortGroupRef;
+
+			// TODO fetch the oid of targetList[targetListIndex]
+			// oid_tl = targetList[targetListIndex];
+			// if (oid_tl == key -> oid)
+			// {
+			//		partitionIsFine = 1
+			// 		break;
+			// }
+		}
+		if (partitionIsFine == 0)
+		{
+			return false;
+		}
+	}
+
+	return true;
 }
 
 
