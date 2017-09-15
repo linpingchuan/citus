@@ -798,8 +798,31 @@ DeferErrorIfCannotPushdownSubquery(Query *subqueryTree, bool outerMostQueryHasLi
 
 	if (subqueryTree->hasWindowFuncs)
 	{
-		preconditionsSatisfied = false;
-		errorDetail = "Window functions are currently unsupported";
+		ListCell *lc = NULL;
+		List *windowList = subqueryTree->windowClause;
+
+		foreach(lc, windowList)
+		{
+			WindowClause *wc = lfirst(lc);
+
+			List *groupClauseList = wc->partitionClause;
+			List *targetEntryList = subqueryTree->targetList;
+
+			List *groupTargetEntryList = GroupTargetEntryList(groupClauseList,
+																	  targetEntryList);
+			bool groupOnPartitionColumn = TargetListOnPartitionColumn(subqueryTree,
+																	  groupTargetEntryList);
+			if (!groupOnPartitionColumn)
+			{
+				preconditionsSatisfied = false;
+				errorDetail = "PARTITION by list without partition column is currently "
+							  "unsupported";
+			}
+		}
+
+
+
+
 	}
 
 	if (subqueryTree->limitOffset)
