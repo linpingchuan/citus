@@ -84,7 +84,7 @@ static DeferredErrorMessage * DeferErrorIfUnsupportedUnionQuery(Query *queryTree
 static bool ExtractSetOperationStatmentWalker(Node *node, List **setOperationList);
 static DeferredErrorMessage * DeferErrorIfUnsupportedTableCombination(Query *queryTree);
 static bool TargetListOnPartitionColumn(Query *query, List *targetEntryList);
-static bool WindowPartitionOnDistributionColumn(Query *query, List *windowList);
+static bool WindowPartitionOnDistributionColumn(Query *query);
 static FieldSelect * CompositeFieldRecursive(Expr *expression, Query *query);
 static bool FullCompositeFieldList(List *compositeFieldList);
 static MultiNode * MultiPlanTree(Query *queryTree);
@@ -849,7 +849,6 @@ DeferErrorIfCannotPushdownSubquery(Query *subqueryTree, bool outerMostQueryHasLi
 		errorDetail = "For Update/Share commands are currently unsupported";
 	}
 
-
 	/* group clause list must include partition column */
 	if (subqueryTree->groupClause)
 	{
@@ -868,16 +867,12 @@ DeferErrorIfCannotPushdownSubquery(Query *subqueryTree, bool outerMostQueryHasLi
 	}
 
 	/*
-	 * We support window functions when there is either a group by on distribution column
-	 * or there is not a group by and window function is partitioned on distribution
-	 * column.
+	 * We support window functions when they are partitioned on distribution column.
 	 */
-	else if (subqueryTree->hasWindowFuncs)
+	if (subqueryTree->hasWindowFuncs)
 	{
-		List *windowList = subqueryTree->windowClause;
-
 		bool windowPartitionOnDistributionColumn =
-							WindowPartitionOnDistributionColumn(subqueryTree, windowList);
+							WindowPartitionOnDistributionColumn(subqueryTree);
 
 		if (!windowPartitionOnDistributionColumn)
 		{
@@ -1166,27 +1161,33 @@ TargetListOnPartitionColumn(Query *query, List *targetEntryList)
  * distribution column.
  */
 static bool
-WindowPartitionOnDistributionColumn(Query *query, List *windowList)
+WindowPartitionOnDistributionColumn(Query *query)
 {
 	ListCell *lc = NULL;
+	List *windowList = query->windowClause;
+	List *partitionClauseList = NULL;
+	List *targetEntryList = NULL;
+	List *groupTargetEntryList = NULL;
+	WindowClause *wc = NULL;
+	bool partitionOnDistributionColumn = false;
 
 	foreach(lc, windowList)
 	{
-		WindowClause *wc = lfirst(lc);
+		wc = lfirst(lc);
 
-		List *partitionClauseList = wc->partitionClause;
-		List *targetEntryList = query->targetList;
+		partitionClauseList = wc->partitionClause;
+		targetEntryList = query->targetList;
 
 		if (!partitionClauseList)
 		{
 			return false;
 		}
 
-		List *groupTargetEntryList = GroupTargetEntryList(partitionClauseList,
-																  targetEntryList);
-		bool partitionOnPartitionColumn =
-			 TargetListOnPartitionColumn(query, groupTargetEntryList);
-		if (!partitionOnPartitionColumn)
+		groupTargetEntryList = GroupTargetEntryList(partitionClauseList, targetEntryList);
+		partitionOnDistributionColumn =
+			 				   TargetListOnPartitionColumn(query, groupTargetEntryList);
+
+		if (!partitionOnDistributionColumn)
 		{
 			return false;
 		}
