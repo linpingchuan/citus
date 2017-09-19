@@ -84,6 +84,7 @@ static DeferredErrorMessage * DeferErrorIfUnsupportedUnionQuery(Query *queryTree
 static bool ExtractSetOperationStatmentWalker(Node *node, List **setOperationList);
 static DeferredErrorMessage * DeferErrorIfUnsupportedTableCombination(Query *queryTree);
 static bool TargetListOnPartitionColumn(Query *query, List *targetEntryList);
+static bool WindowPartitionOnDistributionColumn(Query *query, List *windowList);
 static FieldSelect * CompositeFieldRecursive(Expr *expression, Query *query);
 static bool FullCompositeFieldList(List *compositeFieldList);
 static MultiNode * MultiPlanTree(Query *queryTree);
@@ -796,35 +797,6 @@ DeferErrorIfCannotPushdownSubquery(Query *subqueryTree, bool outerMostQueryHasLi
 		errorDetail = "Subqueries without relations are unsupported";
 	}
 
-	if (subqueryTree->hasWindowFuncs)
-	{
-		ListCell *lc = NULL;
-		List *windowList = subqueryTree->windowClause;
-
-		foreach(lc, windowList)
-		{
-			WindowClause *wc = lfirst(lc);
-
-			List *groupClauseList = wc->partitionClause;
-			List *targetEntryList = subqueryTree->targetList;
-
-			List *groupTargetEntryList = GroupTargetEntryList(groupClauseList,
-																	  targetEntryList);
-			bool groupOnPartitionColumn = TargetListOnPartitionColumn(subqueryTree,
-																	  groupTargetEntryList);
-			if (!groupOnPartitionColumn)
-			{
-				preconditionsSatisfied = false;
-				errorDetail = "PARTITION by list without partition column is currently "
-							  "unsupported";
-			}
-		}
-
-
-
-
-	}
-
 	if (subqueryTree->limitOffset)
 	{
 		preconditionsSatisfied = false;
@@ -877,6 +849,7 @@ DeferErrorIfCannotPushdownSubquery(Query *subqueryTree, bool outerMostQueryHasLi
 		errorDetail = "For Update/Share commands are currently unsupported";
 	}
 
+
 	/* group clause list must include partition column */
 	if (subqueryTree->groupClause)
 	{
@@ -887,9 +860,29 @@ DeferErrorIfCannotPushdownSubquery(Query *subqueryTree, bool outerMostQueryHasLi
 		bool groupOnPartitionColumn = TargetListOnPartitionColumn(subqueryTree,
 																  groupTargetEntryList);
 		if (!groupOnPartitionColumn)
+  		{
+  			preconditionsSatisfied = false;
+  			errorDetail = "Group by list without partition column is currently "
+  						  "unsupported";
+  		}
+	}
+
+	/*
+	 * We support window functions when there is either a group by on distribution column
+	 * or there is not a group by and window function is partitioned on distribution
+	 * column.
+	 */
+	else if (subqueryTree->hasWindowFuncs)
+	{
+		List *windowList = subqueryTree->windowClause;
+
+		bool windowPartitionOnDistributionColumn =
+							WindowPartitionOnDistributionColumn(subqueryTree, windowList);
+
+		if (!windowPartitionOnDistributionColumn)
 		{
 			preconditionsSatisfied = false;
-			errorDetail = "Group by list without partition column is currently "
+			errorDetail = "Partition by list without partition column is currently "
 						  "unsupported";
 		}
 	}
@@ -1165,6 +1158,41 @@ TargetListOnPartitionColumn(Query *query, List *targetEntryList)
 	}
 
 	return targetListOnPartitionColumn;
+}
+
+
+/*
+ * WindowPartitionOnDistributionColumn checks if window function is partitioned over
+ * distribution column.
+ */
+static bool
+WindowPartitionOnDistributionColumn(Query *query, List *windowList)
+{
+	ListCell *lc = NULL;
+
+	foreach(lc, windowList)
+	{
+		WindowClause *wc = lfirst(lc);
+
+		List *partitionClauseList = wc->partitionClause;
+		List *targetEntryList = query->targetList;
+
+		if (!partitionClauseList)
+		{
+			return false;
+		}
+
+		List *groupTargetEntryList = GroupTargetEntryList(partitionClauseList,
+																  targetEntryList);
+		bool partitionOnPartitionColumn =
+			 TargetListOnPartitionColumn(query, groupTargetEntryList);
+		if (!partitionOnPartitionColumn)
+		{
+			return false;
+		}
+	}
+
+	return true;
 }
 
 
