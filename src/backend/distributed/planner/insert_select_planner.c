@@ -484,6 +484,7 @@ RouterModifyTaskForShardInterval(Query *originalQuery, ShardInterval *shardInter
 	List *shardOpExpressions = NIL;
 	RestrictInfo *shardRestrictionList = NULL;
 	DeferredErrorMessage *planningError = NULL;
+	bool multiShardModifyQuery = false;
 
 	/* grab shared metadata lock to stop concurrent placement additions */
 	LockShardDistributionMetadata(shardId, ShareLock);
@@ -543,7 +544,10 @@ RouterModifyTaskForShardInterval(Query *originalQuery, ShardInterval *shardInter
 	 */
 	planningError = PlanRouterQuery(copiedSubquery, copiedRestrictionContext,
 									&selectPlacementList, &selectAnchorShardId,
-									&relationShardList, replacePrunedQueryWithDummy);
+									&relationShardList, replacePrunedQueryWithDummy,
+									&multiShardModifyQuery);
+
+	Assert(!multiShardModifyQuery);
 
 	if (planningError)
 	{

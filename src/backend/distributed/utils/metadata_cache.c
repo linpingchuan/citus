@@ -410,7 +410,7 @@ LoadShardPlacement(uint64 shardId, uint64 placementId)
 
 /*
  * FindShardPlacementOnGroup returns the shard placement for the given shard
- * on the given group, or returns NULL of no placement for the shard exists
+ * on the given group, or returns NULL if no placement for the shard exists
  * on the group.
  */
 ShardPlacement *

@@ -314,6 +314,7 @@ CreateDistributedPlan(PlannedStmt *localPlan, Query *originalQuery, Query *query
 	MultiPlan *distributedPlan = NULL;
 	PlannedStmt *resultPlan = NULL;
 	bool hasUnresolvedParams = false;
+	bool multiShardModifyQuery = false;
 
 	if (HasUnresolvedExternParamsWalker((Node *) originalQuery, boundParams))
 	{
@@ -333,7 +334,8 @@ CreateDistributedPlan(PlannedStmt *localPlan, Query *originalQuery, Query *query
 		{
 			/* modifications are always routed through the same planner/executor */
 			distributedPlan =
-				CreateModifyPlan(originalQuery, query, plannerRestrictionContext);
+				CreateModifyPlan(originalQuery, query, plannerRestrictionContext,
+								 &multiShardModifyQuery);
 		}
 
 		Assert(distributedPlan);
@@ -436,9 +438,10 @@ CreateDistributedPlan(PlannedStmt *localPlan, Query *originalQuery, Query *query
 
 	/*
 	 * As explained above, force planning costs to be unrealistically high if
-	 * query planning failed (possibly) due to prepared statement parameters.
+	 * query planning failed (possibly) due to prepared statement parameters or
+	 * if it is planned as a multi shard modify query.
 	 */
-	if (distributedPlan->planningError && hasUnresolvedParams)
+	if ((distributedPlan->planningError || multiShardModifyQuery) && hasUnresolvedParams)
 	{
 		/*
 		 * Arbitraryly high cost, but low enough that it can be added up

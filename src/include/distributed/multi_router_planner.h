@@ -30,13 +30,15 @@ extern MultiPlan * CreateRouterPlan(Query *originalQuery, Query *query,
 									RelationRestrictionContext *restrictionContext);
 extern MultiPlan * CreateModifyPlan(Query *originalQuery, Query *query,
 									PlannerRestrictionContext *
-									plannerRestrictionContext);
+									plannerRestrictionContext,
+									bool *multiShardModifyQuery);
 extern DeferredErrorMessage * PlanRouterQuery(Query *originalQuery,
 											  RelationRestrictionContext *
 											  restrictionContext,
 											  List **placementList, uint64 *anchorShardId,
 											  List **relationShardList, bool
-											  replacePrunedQueryWithDummy);
+											  replacePrunedQueryWithDummy,
+											  bool *multiShardModifyQuery);
 extern List * RouterInsertTaskList(Query *query, DeferredErrorMessage **planningError);
 extern List * IntersectPlacementList(List *lhsPlacementList, List *rhsPlacementList);
 extern DeferredErrorMessage * ModifyQuerySupported(Query *queryTree,
