@@ -64,6 +64,7 @@ typedef struct MasterAggregateWalkerContext
 {
 	bool repartitionSubquery;
 	AttrNumber columnId;
+	bool groupedByPartitionColumn;
 } MasterAggregateWalkerContext;
 
 typedef struct WorkerAggregateWalkerContext
@@ -71,6 +72,7 @@ typedef struct WorkerAggregateWalkerContext
 	bool repartitionSubquery;
 	List *expressionList;
 	bool createGroupByClause;
+	bool groupedByPartitionColumn;
 } WorkerAggregateWalkerContext;
 
 
@@ -117,7 +119,8 @@ static void ApplyExtendedOpNodes(MultiExtendedOp *originalNode,
 								 MultiExtendedOp *masterNode,
 								 MultiExtendedOp *workerNode);
 static void TransformSubqueryNode(MultiTable *subqueryNode, List *tableNodeList);
-static MultiExtendedOp * MasterExtendedOpNode(MultiExtendedOp *originalOpNode);
+static MultiExtendedOp * MasterExtendedOpNode(MultiExtendedOp *originalOpNode, bool groupedByDisjointPartitionColumn,
+		 List *tableNodeList);
 static Node * MasterAggregateMutator(Node *originalNode,
 									 MasterAggregateWalkerContext *walkerContext);
 static Expr * MasterAggregateExpression(Aggref *originalAggregate,
@@ -126,7 +129,8 @@ static Expr * MasterAverageExpression(Oid sumAggregateType, Oid countAggregateTy
 									  AttrNumber *columnId);
 static Expr * AddTypeConversion(Node *originalAggregate, Node *newExpression);
 static MultiExtendedOp * WorkerExtendedOpNode(MultiExtendedOp *originalOpNode,
-											  bool groupedByDisjointPartitionColumn);
+											  bool groupedByDisjointPartitionColumn,
+											  List *tableNodeList);
 static bool WorkerAggregateWalker(Node *node,
 								  WorkerAggregateWalkerContext *walkerContext);
 static List * WorkerAggregateExpressionList(Aggref *originalAggregate,
@@ -261,9 +265,9 @@ MultiLogicalPlanOptimize(MultiTreeRoot *multiLogicalPlan)
 	groupedByDisjointPartitionColumn = GroupedByDisjointPartitionColumn(tableNodeList,
 																		extendedOpNode);
 
-	masterExtendedOpNode = MasterExtendedOpNode(extendedOpNode);
+	masterExtendedOpNode = MasterExtendedOpNode(extendedOpNode, groupedByDisjointPartitionColumn, tableNodeList);
 	workerExtendedOpNode = WorkerExtendedOpNode(extendedOpNode,
-												groupedByDisjointPartitionColumn);
+												groupedByDisjointPartitionColumn, tableNodeList);
 
 	ApplyExtendedOpNodes(extendedOpNode, masterExtendedOpNode, workerExtendedOpNode);
 
@@ -1168,7 +1172,7 @@ TransformSubqueryNode(MultiTable *subqueryNode, List *tableNodeList)
 	MultiNode *collectChildNode = ChildNode((MultiUnaryNode *) collectNode);
 	bool groupedByDisjointPartitionColumn =
 		GroupedByDisjointPartitionColumn(tableNodeList, extendedOpNode);
-	MultiExtendedOp *masterExtendedOpNode = MasterExtendedOpNode(extendedOpNode);
+	MultiExtendedOp *masterExtendedOpNode = MasterExtendedOpNode(extendedOpNode, groupedByDisjointPartitionColumn);
 	MultiExtendedOp *workerExtendedOpNode =
 		WorkerExtendedOpNode(extendedOpNode, groupedByDisjointPartitionColumn);
 	MultiPartition *partitionNode = CitusMakeNode(MultiPartition);
@@ -1232,7 +1236,8 @@ TransformSubqueryNode(MultiTable *subqueryNode, List *tableNodeList)
  * worker nodes' results.
  */
 static MultiExtendedOp *
-MasterExtendedOpNode(MultiExtendedOp *originalOpNode)
+MasterExtendedOpNode(MultiExtendedOp *originalOpNode, bool groupedByDisjointPartitionColumn,
+		 List *tableNodeList)
 {
 	MultiExtendedOp *masterExtendedOpNode = NULL;
 	List *targetEntryList = originalOpNode->targetList;
@@ -1247,6 +1252,7 @@ MasterExtendedOpNode(MultiExtendedOp *originalOpNode)
 
 	walkerContext->columnId = 1;
 	walkerContext->repartitionSubquery = false;
+	walkerContext->groupedByPartitionColumn = groupedByDisjointPartitionColumn;
 
 	if (CitusIsA(parentNode, MultiTable) && CitusIsA(childNode, MultiCollect))
 	{
@@ -1379,7 +1385,7 @@ MasterAggregateExpression(Aggref *originalAggregate,
 
 	if (aggregateType == AGGREGATE_COUNT && originalAggregate->aggdistinct &&
 		CountDistinctErrorRate == DISABLE_DISTINCT_APPROXIMATION &&
-		walkerContext->repartitionSubquery)
+		!walkerContext->groupedByPartitionColumn)
 	{
 		Aggref *aggregate = (Aggref *) copyObject(originalAggregate);
 		List *varList = pull_var_clause_default((Node *) aggregate);
@@ -1775,7 +1781,8 @@ AddTypeConversion(Node *originalAggregate, Node *newExpression)
  */
 static MultiExtendedOp *
 WorkerExtendedOpNode(MultiExtendedOp *originalOpNode,
-					 bool groupedByDisjointPartitionColumn)
+					 bool groupedByDisjointPartitionColumn,
+					 List *tableNodeList)
 {
 	MultiExtendedOp *workerExtendedOpNode = NULL;
 	MultiNode *parentNode = ParentNode((MultiNode *) originalOpNode);
@@ -1788,11 +1795,12 @@ WorkerExtendedOpNode(MultiExtendedOp *originalOpNode,
 	AttrNumber targetProjectionNumber = 1;
 	WorkerAggregateWalkerContext *walkerContext =
 		palloc0(sizeof(WorkerAggregateWalkerContext));
-	Index nextSortGroupRefIndex = 0;
+	Index nextSortGroupRefIndex = 1;
 	bool queryHasAggregates = false;
 
 	walkerContext->repartitionSubquery = false;
 	walkerContext->expressionList = NIL;
+	walkerContext->groupedByPartitionColumn = groupedByDisjointPartitionColumn;
 
 	if (CitusIsA(parentNode, MultiTable) && CitusIsA(childNode, MultiCollect))
 	{
@@ -1826,6 +1834,9 @@ WorkerExtendedOpNode(MultiExtendedOp *originalOpNode,
 
 		if (hasAggregates)
 		{
+			List *targetColumnList = pull_var_clause_default((Node *) originalExpression);
+			Var *firstColumn = (Var *) linitial(targetColumnList);
+			GroupedByColumn(groupClauseList, targetList, column)
 			WorkerAggregateWalker((Node *) originalExpression, walkerContext);
 
 			newExpressionList = walkerContext->expressionList;
@@ -2016,7 +2027,7 @@ WorkerAggregateExpressionList(Aggref *originalAggregate,
 
 	if (aggregateType == AGGREGATE_COUNT && originalAggregate->aggdistinct &&
 		CountDistinctErrorRate == DISABLE_DISTINCT_APPROXIMATION &&
-		walkerContext->repartitionSubquery)
+		!walkerContext->groupedByPartitionColumn)
 	{
 		Aggref *aggregate = (Aggref *) copyObject(originalAggregate);
 		List *columnList = pull_var_clause_default((Node *) aggregate);
@@ -2661,8 +2672,14 @@ ErrorIfUnsupportedAggregateDistinct(Aggref *aggregateExpression,
 	}
 	else if (distinctSupported)
 	{
-		bool supports = TablePartitioningSupportsDistinct(tableNodeList, extendedOpNode,
+		bool supports = true;
+
+		if (aggregateType != AGGREGATE_COUNT)
+		{
+			supports = TablePartitioningSupportsDistinct(tableNodeList, extendedOpNode,
 														  distinctColumn);
+		}
+
 		if (!supports)
 		{
 			distinctSupported = false;
