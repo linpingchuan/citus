@@ -65,6 +65,7 @@ typedef struct MasterAggregateWalkerContext
 	bool repartitionSubquery;
 	AttrNumber columnId;
 	bool groupedByPartitionColumn;
+	bool hasPartitionColumn;
 } MasterAggregateWalkerContext;
 
 typedef struct WorkerAggregateWalkerContext
@@ -73,6 +74,7 @@ typedef struct WorkerAggregateWalkerContext
 	List *expressionList;
 	bool createGroupByClause;
 	bool groupedByPartitionColumn;
+	bool hasPartitionColumn;
 } WorkerAggregateWalkerContext;
 
 
@@ -119,8 +121,9 @@ static void ApplyExtendedOpNodes(MultiExtendedOp *originalNode,
 								 MultiExtendedOp *masterNode,
 								 MultiExtendedOp *workerNode);
 static void TransformSubqueryNode(MultiTable *subqueryNode, List *tableNodeList);
-static MultiExtendedOp * MasterExtendedOpNode(MultiExtendedOp *originalOpNode, bool groupedByDisjointPartitionColumn,
-		 List *tableNodeList);
+static MultiExtendedOp * MasterExtendedOpNode(MultiExtendedOp *originalOpNode, bool
+											  groupedByDisjointPartitionColumn,
+											  List *tableNodeList);
 static Node * MasterAggregateMutator(Node *originalNode,
 									 MasterAggregateWalkerContext *walkerContext);
 static Expr * MasterAggregateExpression(Aggref *originalAggregate,
@@ -131,6 +134,7 @@ static Expr * AddTypeConversion(Node *originalAggregate, Node *newExpression);
 static MultiExtendedOp * WorkerExtendedOpNode(MultiExtendedOp *originalOpNode,
 											  bool groupedByDisjointPartitionColumn,
 											  List *tableNodeList);
+static bool ExpressionContainsPartitionColumn(Node *expression, List *tableNodeList);
 static bool WorkerAggregateWalker(Node *node,
 								  WorkerAggregateWalkerContext *walkerContext);
 static List * WorkerAggregateExpressionList(Aggref *originalAggregate,
@@ -265,9 +269,12 @@ MultiLogicalPlanOptimize(MultiTreeRoot *multiLogicalPlan)
 	groupedByDisjointPartitionColumn = GroupedByDisjointPartitionColumn(tableNodeList,
 																		extendedOpNode);
 
-	masterExtendedOpNode = MasterExtendedOpNode(extendedOpNode, groupedByDisjointPartitionColumn, tableNodeList);
+	masterExtendedOpNode = MasterExtendedOpNode(extendedOpNode,
+												groupedByDisjointPartitionColumn,
+												tableNodeList);
 	workerExtendedOpNode = WorkerExtendedOpNode(extendedOpNode,
-												groupedByDisjointPartitionColumn, tableNodeList);
+												groupedByDisjointPartitionColumn,
+												tableNodeList);
 
 	ApplyExtendedOpNodes(extendedOpNode, masterExtendedOpNode, workerExtendedOpNode);
 
@@ -1172,9 +1179,12 @@ TransformSubqueryNode(MultiTable *subqueryNode, List *tableNodeList)
 	MultiNode *collectChildNode = ChildNode((MultiUnaryNode *) collectNode);
 	bool groupedByDisjointPartitionColumn =
 		GroupedByDisjointPartitionColumn(tableNodeList, extendedOpNode);
-	MultiExtendedOp *masterExtendedOpNode = MasterExtendedOpNode(extendedOpNode, groupedByDisjointPartitionColumn);
+	MultiExtendedOp *masterExtendedOpNode = MasterExtendedOpNode(extendedOpNode,
+																 groupedByDisjointPartitionColumn,
+																 tableNodeList);
 	MultiExtendedOp *workerExtendedOpNode =
-		WorkerExtendedOpNode(extendedOpNode, groupedByDisjointPartitionColumn);
+		WorkerExtendedOpNode(extendedOpNode, groupedByDisjointPartitionColumn,
+							 tableNodeList);
 	MultiPartition *partitionNode = CitusMakeNode(MultiPartition);
 	List *groupClauseList = extendedOpNode->groupClauseList;
 	List *targetEntryList = extendedOpNode->targetList;
@@ -1236,8 +1246,9 @@ TransformSubqueryNode(MultiTable *subqueryNode, List *tableNodeList)
  * worker nodes' results.
  */
 static MultiExtendedOp *
-MasterExtendedOpNode(MultiExtendedOp *originalOpNode, bool groupedByDisjointPartitionColumn,
-		 List *tableNodeList)
+MasterExtendedOpNode(MultiExtendedOp *originalOpNode, bool
+					 groupedByDisjointPartitionColumn,
+					 List *tableNodeList)
 {
 	MultiExtendedOp *masterExtendedOpNode = NULL;
 	List *targetEntryList = originalOpNode->targetList;
@@ -1253,6 +1264,7 @@ MasterExtendedOpNode(MultiExtendedOp *originalOpNode, bool groupedByDisjointPart
 	walkerContext->columnId = 1;
 	walkerContext->repartitionSubquery = false;
 	walkerContext->groupedByPartitionColumn = groupedByDisjointPartitionColumn;
+	walkerContext->hasPartitionColumn = false;
 
 	if (CitusIsA(parentNode, MultiTable) && CitusIsA(childNode, MultiCollect))
 	{
@@ -1266,8 +1278,11 @@ MasterExtendedOpNode(MultiExtendedOp *originalOpNode, bool groupedByDisjointPart
 		TargetEntry *newTargetEntry = copyObject(originalTargetEntry);
 		Expr *originalExpression = originalTargetEntry->expr;
 		Expr *newExpression = NULL;
-
 		bool hasAggregates = contain_agg_clause((Node *) originalExpression);
+
+		walkerContext->hasPartitionColumn = ExpressionContainsPartitionColumn(
+			(Node *) originalExpression, tableNodeList);
+
 		if (hasAggregates)
 		{
 			Node *newNode = MasterAggregateMutator((Node *) originalExpression,
@@ -1385,7 +1400,7 @@ MasterAggregateExpression(Aggref *originalAggregate,
 
 	if (aggregateType == AGGREGATE_COUNT && originalAggregate->aggdistinct &&
 		CountDistinctErrorRate == DISABLE_DISTINCT_APPROXIMATION &&
-		!walkerContext->groupedByPartitionColumn)
+		!walkerContext->groupedByPartitionColumn && !walkerContext->hasPartitionColumn)
 	{
 		Aggref *aggregate = (Aggref *) copyObject(originalAggregate);
 		List *varList = pull_var_clause_default((Node *) aggregate);
@@ -1801,6 +1816,7 @@ WorkerExtendedOpNode(MultiExtendedOp *originalOpNode,
 	walkerContext->repartitionSubquery = false;
 	walkerContext->expressionList = NIL;
 	walkerContext->groupedByPartitionColumn = groupedByDisjointPartitionColumn;
+	walkerContext->hasPartitionColumn = false;
 
 	if (CitusIsA(parentNode, MultiTable) && CitusIsA(childNode, MultiCollect))
 	{
@@ -1834,9 +1850,9 @@ WorkerExtendedOpNode(MultiExtendedOp *originalOpNode,
 
 		if (hasAggregates)
 		{
-			List *targetColumnList = pull_var_clause_default((Node *) originalExpression);
-			Var *firstColumn = (Var *) linitial(targetColumnList);
-			GroupedByColumn(groupClauseList, targetList, column)
+			walkerContext->hasPartitionColumn = ExpressionContainsPartitionColumn(
+				(Node *) originalExpression, tableNodeList);
+
 			WorkerAggregateWalker((Node *) originalExpression, walkerContext);
 
 			newExpressionList = walkerContext->expressionList;
@@ -1969,6 +1985,42 @@ WorkerExtendedOpNode(MultiExtendedOp *originalOpNode,
 }
 
 
+static bool
+ExpressionContainsPartitionColumn(Node *expression, List *tableNodeList)
+{
+	List *targetColumnList = pull_var_clause_default((Node *) expression);
+	Var *firstColumn =  NULL;
+	ListCell *tableNodeCell = NULL;
+
+	if (targetColumnList == NIL)
+	{
+		return false;
+	}
+
+	firstColumn = (Var *) linitial(targetColumnList);
+
+	foreach(tableNodeCell, tableNodeList)
+	{
+		MultiTable *tableNode = lfirst(tableNodeCell);
+		Var *partitionColumn = tableNode->partitionColumn;
+
+		if (partitionColumn != NULL &&
+			partitionColumn->varno == firstColumn->varno &&
+			partitionColumn->varattno == firstColumn->varattno)
+		{
+			Assert(partitionColumn->varno == tableNode->rangeTableId);
+
+			if (PartitionMethod(tableNode->relationId) != DISTRIBUTE_BY_APPEND)
+			{
+				return true;
+			}
+		}
+	}
+
+	return false;
+}
+
+
 /*
  * WorkerAggregateWalker walks over the original target entry expression, and
  * creates the list of expression trees (potentially more than one) to execute
@@ -2027,7 +2079,7 @@ WorkerAggregateExpressionList(Aggref *originalAggregate,
 
 	if (aggregateType == AGGREGATE_COUNT && originalAggregate->aggdistinct &&
 		CountDistinctErrorRate == DISABLE_DISTINCT_APPROXIMATION &&
-		!walkerContext->groupedByPartitionColumn)
+		!walkerContext->groupedByPartitionColumn && !walkerContext->hasPartitionColumn)
 	{
 		Aggref *aggregate = (Aggref *) copyObject(originalAggregate);
 		List *columnList = pull_var_clause_default((Node *) aggregate);
@@ -2677,7 +2729,7 @@ ErrorIfUnsupportedAggregateDistinct(Aggref *aggregateExpression,
 		if (aggregateType != AGGREGATE_COUNT)
 		{
 			supports = TablePartitioningSupportsDistinct(tableNodeList, extendedOpNode,
-														  distinctColumn);
+														 distinctColumn);
 		}
 
 		if (!supports)
