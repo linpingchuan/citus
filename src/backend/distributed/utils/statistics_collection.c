@@ -24,8 +24,12 @@ bool EnableStatisticsCollection = true; /* send basic usage statistics to Citus 
 #include "distributed/worker_manager.h"
 #include "lib/stringinfo.h"
 #include "utils/builtins.h"
-#include "utils/fmgrprotos.h"
 #include "utils/json.h"
+#include "utils/jsonb.h"
+
+#if PG_VERSION_NUM >= 100000
+#include "utils/fmgrprotos.h"
+#endif
 
 static size_t CheckForUpdatesCallback(char *contents, size_t size, size_t count,
 									  void *userData);
