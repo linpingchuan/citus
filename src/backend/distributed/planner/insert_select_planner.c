@@ -269,15 +269,6 @@ CreateDistributedInsertSelectPlan(Query *originalQuery,
 		++taskIdIndex;
 	}
 
-	if (MultiTaskQueryLogLevel != MULTI_TASK_QUERY_INFO_OFF &&
-		list_length(sqlTaskList) > 1)
-	{
-		ereport(MultiTaskQueryLogLevel, (errmsg("multi-task query about to be executed"),
-										 errhint("Queries are split to multiple tasks "
-												 "if they have to be split into several"
-												 " queries on the workers.")));
-	}
-
 	/* Create the worker job */
 	workerJob = CitusMakeNode(Job);
 	workerJob->taskList = sqlTaskList;

@@ -37,6 +37,7 @@
 
 
 static List *plannerRestrictionContextList = NIL;
+int MultiTaskQueryLogLevel = MULTI_TASK_QUERY_INFO_OFF; /* multi-task query log level */
 
 /* create custom scan methods for separate executors */
 static CustomScanMethods RealTimeCustomScanMethods = {
@@ -530,6 +531,22 @@ FinalizePlan(PlannedStmt *localPlan, MultiPlan *multiPlan)
 		{
 			customScan->methods = &DelayedErrorCustomScanMethods;
 			break;
+		}
+	}
+
+	if (executorType != MULTI_EXECUTOR_COORDINATOR_INSERT_SELECT &&
+		multiPlan->workerJob != NULL &&
+		list_length(multiPlan->workerJob->taskList) > 1)
+	{
+		/* if it is not a single task executable plan, inform user according to the log level */
+		if (MultiTaskQueryLogLevel != MULTI_TASK_QUERY_INFO_OFF)
+		{
+			ereport(MultiTaskQueryLogLevel, (errmsg(
+												 "multi-task query about to be executed"),
+											 errhint(
+												 "Queries are split to multiple tasks "
+												 "if they have to be split into several"
+												 " queries on the workers.")));
 		}
 	}
 

@@ -149,6 +149,7 @@ static List * get_all_actual_clauses(List *restrictinfo_list);
 static int CompareInsertValuesByShardId(const void *leftElement,
 										const void *rightElement);
 static bool MultipleDistributedTableList(List *relationShardList);
+static DeferredErrorMessage * MultiShardModifyQuerySupported(List *relationShardList);
 
 
 /*
@@ -216,9 +217,10 @@ CreateModifyPlan(Query *originalQuery, Query *query,
 		return multiPlan;
 	}
 
-	/* TODO : Should I change the location of this log or make it conditional on */
-	/* multiShardModifyQuery ? */
-	ereport(DEBUG2, (errmsg("Creating router plan")));
+	if (*multiShardModifyQuery == false)
+	{
+		ereport(DEBUG2, (errmsg("Creating router plan")));
+	}
 
 	multiPlan->workerJob = job;
 	multiPlan->masterQuery = NULL;
@@ -1392,39 +1394,27 @@ RouterJob(Query *originalQuery, RelationRestrictionContext *restrictionContext,
 
 	/*
 	 * If it's a multiple shard update/delete query we need to create task for
-	 * each shard placement.
+	 * each shard interval.
 	 */
 	if (*multiShardModifyQuery)
 	{
 		List *taskList = NIL;
-		ListCell *shardPlacementCell = NULL;
-		uint64 jobId = INVALID_JOB_ID;
+		ListCell *relationShardCell = NULL;
 		int taskId = 1;
 
-		/* lock metadata before getting placement lists */
-		LockShardListMetadata(placementList, ShareLock);
-
-		foreach(shardPlacementCell, placementList)
+		foreach(relationShardCell, relationShardList)
 		{
-			ShardPlacement *shardPlacement = (ShardPlacement *) lfirst(
-				shardPlacementCell);
-			ShardInterval *shardInterval = LoadShardInterval(shardPlacement->shardId);
-			Oid relationId = shardInterval->relationId;
-			uint64 shardId = shardInterval->shardId;
+			RelationShard *relationShard = (RelationShard *) lfirst(relationShardCell);
+			Oid relationId = relationShard->relationId;
+			uint64 shardId = relationShard->shardId;
 			StringInfo shardQueryString = makeStringInfo();
-			Task *task = NULL;
+			Task *task = CreateTask(MODIFY_TASK);
 
 			deparse_shard_query(originalQuery, relationId, shardId, shardQueryString);
 
-			task = CitusMakeNode(Task);
-			task->jobId = jobId;
 			task->taskId = taskId++;
-			task->taskType = MODIFY_TASK;
-			task->queryString = shardQueryString->data;
-			task->dependedTaskList = NULL;
-			task->replicationModel = REPLICATION_MODEL_INVALID;
 			task->anchorShardId = shardId;
-			task->taskPlacementList = FinalizedShardPlacementList(shardId);
+			task->queryString = shardQueryString->data;
 
 			taskList = lappend(taskList, task);
 		}
@@ -1573,6 +1563,7 @@ PlanRouterQuery(Query *originalQuery, RelationRestrictionContext *restrictionCon
 	bool shardsPresent = false;
 	uint64 shardId = INVALID_SHARD_ID;
 	CmdType commandType = originalQuery->commandType;
+	bool localMultiShardModifyQuery = false;
 
 	*placementList = NIL;
 	prunedRelationShardList = TargetShardIntervalsForRouter(originalQuery,
@@ -1595,16 +1586,22 @@ PlanRouterQuery(Query *originalQuery, RelationRestrictionContext *restrictionCon
 		}
 		else if (commandType == CMD_UPDATE || commandType == CMD_DELETE)
 		{
-			*multiShardModifyQuery = true;
+			planningError = MultiShardModifyQuerySupported(prunedRelationShardList);
+
+			if (planningError != NULL)
+			{
+				prunedRelationShardList = NIL;
+				return planningError;
+			}
+
+			localMultiShardModifyQuery = true;
 		}
 	}
 
 	foreach(prunedRelationShardListCell, prunedRelationShardList)
 	{
 		List *prunedShardList = (List *) lfirst(prunedRelationShardListCell);
-
-		ShardInterval *shardInterval = NULL;
-		RelationShard *relationShard = NULL;
+		ListCell *shardIntervalCell = NULL;
 
 		/* no shard is present or all shards are pruned out case will be handled later */
 		if (prunedShardList == NIL)
@@ -1614,27 +1611,34 @@ PlanRouterQuery(Query *originalQuery, RelationRestrictionContext *restrictionCon
 
 		shardsPresent = true;
 
-		shardInterval = (ShardInterval *) linitial(prunedShardList);
-
-		/* anchor shard id */
-		if (shardId == INVALID_SHARD_ID)
+		foreach(shardIntervalCell, prunedShardList)
 		{
-			shardId = shardInterval->shardId;
+			ShardInterval *shardInterval = (ShardInterval *) lfirst(shardIntervalCell);
+			RelationShard *relationShard = CitusMakeNode(RelationShard);
+
+			relationShard->relationId = shardInterval->relationId;
+			relationShard->shardId = shardInterval->shardId;
+
+			/*
+			 * We need anchor shard id for compute tasks. Also, note that we have
+			 * single shard interval for select queries at this point. Therefore,
+			 * condition below should run once only for router select queries.
+			 */
+			if (!localMultiShardModifyQuery)
+			{
+				shardId = relationShard->shardId;
+			}
+
+			*relationShardList = lappend(*relationShardList, relationShard);
 		}
-
-		/* add relation to shard mapping */
-		relationShard = CitusMakeNode(RelationShard);
-		relationShard->relationId = shardInterval->relationId;
-		relationShard->shardId = shardInterval->shardId;
-
-		*relationShardList = lappend(*relationShardList, relationShard);
 	}
 
 	/*
 	 * We bail out if there are RTEs that prune multiple shards above, but
-	 * there can also be multiple RTEs that reference the same relation.
+	 * there can also be multiple RTEs that reference the same relation. It is
+	 * ok if we run update/delete queries targeting multiple shards.
 	 */
-	if (RelationPrunesToMultipleShards(*relationShardList))
+	if (!localMultiShardModifyQuery && RelationPrunesToMultipleShards(*relationShardList))
 	{
 		planningError = DeferredError(ERRCODE_FEATURE_NOT_SUPPORTED,
 									  "cannot run command which targets "
@@ -1648,7 +1652,7 @@ PlanRouterQuery(Query *originalQuery, RelationRestrictionContext *restrictionCon
 	 * still run the query but the result will be empty. We create a dummy shard
 	 * placement for the first active worker.
 	 */
-	if (!(*multiShardModifyQuery))
+	if (!localMultiShardModifyQuery)
 	{
 		if (shardsPresent)
 		{
@@ -1691,18 +1695,6 @@ PlanRouterQuery(Query *originalQuery, RelationRestrictionContext *restrictionCon
 	}
 	else
 	{
-		if (MultipleDistributedTableList(prunedRelationShardList))
-		{
-			ereport(DEBUG2, (errmsg("Support only single distributed table with multi"
-									" shard modify commands")));
-
-			planningError = DeferredError(ERRCODE_FEATURE_NOT_SUPPORTED,
-										  "support only single distributed table with "
-										  "multi shard modify commands",
-										  NULL, NULL);
-			return planningError;
-		}
-
 		workerList = WorkersContainingModifyShards(prunedRelationShardList);
 	}
 
@@ -1710,19 +1702,44 @@ PlanRouterQuery(Query *originalQuery, RelationRestrictionContext *restrictionCon
 	/*
 	 * If this is an UPDATE or DELETE query which requires master evaluation,
 	 * don't try update shard names, and postpone that to execution phase.
-	 *
-	 * If the query is a multi-shard one also postpone that to execution phase.
 	 */
 	if (!multiShardQuery && !(UpdateOrDeleteQuery(originalQuery) &&
-							  RequiresMasterEvaluation(originalQuery)))
+		RequiresMasterEvaluation(originalQuery)))
 	{
 		UpdateRelationToShardNames((Node *) originalQuery, *relationShardList);
 	}
 
+	*multiShardModifyQuery = localMultiShardModifyQuery;
 	*placementList = workerList;
 	*anchorShardId = shardId;
 
 	return planningError;
+}
+
+
+/*
+ * MultiShardModifyQuerySupported checks whether the query and pruned relation
+ * shard list is supported. It is supported if there is single table in the
+ * relation shard list and query doesn't contain any volatile function.
+ */
+static DeferredErrorMessage *
+MultiShardModifyQuerySupported(List *relationShardList)
+{
+	DeferredErrorMessage *planningError = NULL;
+
+	if (MultipleDistributedTableList(relationShardList))
+	{
+		ereport(DEBUG2, (errmsg("Support only single distributed table with multi"
+								" shard modify commands")));
+
+		planningError = DeferredError(ERRCODE_FEATURE_NOT_SUPPORTED,
+									  "support only single distributed table with "
+									  "multi shard modify commands",
+									  NULL, NULL);
+		return planningError;
+	}
+
+	return NULL;
 }
 
 
@@ -1734,7 +1751,7 @@ static bool
 MultipleDistributedTableList(List *relationShardLists)
 {
 	ListCell *relationShardListCell = NULL;
-	List *relationIds = NIL;
+	Oid firstRelationId = InvalidOid;
 
 	foreach(relationShardListCell, relationShardLists)
 	{
@@ -1746,9 +1763,11 @@ MultipleDistributedTableList(List *relationShardLists)
 			ShardInterval *shardInterval = (ShardInterval *) lfirst(shardIntervalCell);
 			Oid relationId = shardInterval->relationId;
 
-			relationIds = list_append_unique_oid(relationIds, relationId);
-
-			if (list_length(relationIds) > 1)
+			if (firstRelationId == InvalidOid)
+			{
+				firstRelationId = relationId;
+			}
+			else if (relationId != firstRelationId)
 			{
 				return true;
 			}
@@ -1912,6 +1931,12 @@ WorkersContainingSelectShards(List *prunedShardIntervalsList)
 }
 
 
+/*
+ * WorkersContainingModifyShards returns list of shard placements that contain all
+ * shard intervals provided to the update or delete query. It returns NIL if no
+ * placement exists. The caller should check if there are any shard intervals
+ * exist for placement check prior to calling this function.
+ */
 static List *
 WorkersContainingModifyShards(List *prunedShardIntervalsList)
 {
@@ -1922,11 +1947,6 @@ WorkersContainingModifyShards(List *prunedShardIntervalsList)
 	{
 		List *shardIntervalList = (List *) lfirst(prunedShardIntervalCell);
 		ListCell *shardIntervalCell = NULL;
-
-		if (shardIntervalList == NIL)
-		{
-			continue;
-		}
 
 		foreach(shardIntervalCell, shardIntervalList)
 		{
