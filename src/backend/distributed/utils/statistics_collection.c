@@ -27,18 +27,11 @@ bool EnableStatisticsCollection = true; /* send basic usage statistics to Citus 
 #include "utils/fmgrprotos.h"
 #include "utils/json.h"
 
-<<<<<<< HEAD
-=======
-bool EnableStatisticsCollection = true; /* send basic usage statistics to Citus */
-
-#if HAVE_LIBCURL
-
 static size_t CheckForUpdatesCallback(char *contents, size_t size, size_t count,
 									  void *userData);
 static bool JsonbFieldExists(Datum jsonb, const char *fieldName);
 static int JsonbFieldInt(Datum jsonb, const char *fieldName);
 static StringInfo JsonbFieldStr(Datum jsonb, const char *fieldName);
->>>>>>> Initial version of checking for updates.
 static uint64 NextPow2(uint64 n);
 static uint64 ClusterSize(List *distributedTableList);
 static bool SendHttpPostJsonRequest(const char *url, const char *postFields, long
