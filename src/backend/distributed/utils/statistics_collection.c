@@ -23,12 +23,26 @@ bool EnableStatisticsCollection = true; /* send basic usage statistics to Citus 
 #include "distributed/statistics_collection.h"
 #include "distributed/worker_manager.h"
 #include "lib/stringinfo.h"
+#include "utils/builtins.h"
+#include "utils/fmgrprotos.h"
 #include "utils/json.h"
 
+<<<<<<< HEAD
+=======
+bool EnableStatisticsCollection = true; /* send basic usage statistics to Citus */
+
+#if HAVE_LIBCURL
+
+static size_t CheckForUpdatesCallback(char *contents, size_t size, size_t count,
+									  void *userData);
+static bool JsonbFieldExists(Datum jsonb, const char *fieldName);
+static int JsonbFieldInt(Datum jsonb, const char *fieldName);
+static StringInfo JsonbFieldStr(Datum jsonb, const char *fieldName);
+>>>>>>> Initial version of checking for updates.
 static uint64 NextPow2(uint64 n);
 static uint64 ClusterSize(List *distributedTableList);
 static bool SendHttpPostJsonRequest(const char *url, const char *postFields, long
-									timeoutSeconds);
+									timeoutSeconds, curl_write_callback responseCallback);
 
 /* WarnIfSyncDNS warns if libcurl is compiled with synchronous DNS. */
 void
@@ -86,7 +100,129 @@ CollectBasicUsageStatistics(void)
 	appendStringInfoString(fields, "}");
 
 	return SendHttpPostJsonRequest(STATS_COLLECTION_HOST "/v1/usage_reports",
-								   fields->data, HTTP_TIMEOUT_SECONDS);
+								   fields->data, HTTP_TIMEOUT_SECONDS, NULL);
+}
+
+
+/* CheckForUpdates queries Citus servers for newer releases of Citus. */
+void
+CheckForUpdates(void)
+{
+	SendHttpPostJsonRequest(
+		STATS_COLLECTION_HOST "/v1/releases/latest?flavor=community",
+		NULL, HTTP_TIMEOUT_SECONDS, &CheckForUpdatesCallback);
+}
+
+
+/*
+ * CheckForUpdatesCallback receives the response for the request sent by
+ * CheckForUpdates(). It processes the response, and if there is a newer release
+ * of Citus available, logs a LOG message. This function returns 0 if there are
+ * any errors in the received response, which means we didn't consume the data.
+ * Otherwise, it returns (size * count) which means we consumed all of the data.
+ */
+static size_t
+CheckForUpdatesCallback(char *contents, size_t size, size_t count, void *userData)
+{
+	PG_TRY();
+	{
+		const int citusVersionMajor = CITUS_VERSION_NUM / 10000;
+		const int citusVersionMinor = (CITUS_VERSION_NUM / 100) % 100;
+		const int citusVersionPatch = CITUS_VERSION_NUM % 100;
+		Datum responseJson = 0;
+		StringInfo releaseVersion = NULL;
+		int releaseMajor = 0;
+		int releaseMinor = 0;
+		int releasePatch = 0;
+		char *updateType = NULL;
+
+		StringInfo responseNullTerminated = makeStringInfo();
+		appendBinaryStringInfo(responseNullTerminated, contents, size * count);
+		responseJson = DirectFunctionCall1(jsonb_in,
+										   CStringGetDatum(responseNullTerminated->data));
+
+		if (!JsonbFieldExists(responseJson, "version") ||
+			!JsonbFieldExists(responseJson, "major") ||
+			!JsonbFieldExists(responseJson, "minor") ||
+			!JsonbFieldExists(responseJson, "patch"))
+		{
+			return 0;
+		}
+
+		releaseVersion = JsonbFieldStr(responseJson, "version");
+		releaseMajor = JsonbFieldInt(responseJson, "major");
+		releaseMinor = JsonbFieldInt(responseJson, "minor");
+		releasePatch = JsonbFieldInt(responseJson, "patch");
+
+		if (releaseMajor > citusVersionMajor)
+		{
+			updateType = "major";
+		}
+		else if (releaseMajor == citusVersionMajor &&
+				 releaseMinor > citusVersionMinor)
+		{
+			updateType = "minor";
+		}
+		else if (releaseMajor == citusVersionMajor &&
+				 releaseMinor == citusVersionMinor &&
+				 releasePatch > citusVersionPatch)
+		{
+			updateType = "patch";
+		}
+
+		if (updateType != NULL)
+		{
+			ereport(LOG, (errmsg("a newer %s release of Citus (%s) is available",
+								 updateType, releaseVersion->data)));
+		}
+
+		return size * count;
+	}
+	PG_CATCH();
+	{
+		FlushErrorState();
+		return 0;
+	}
+	PG_END_TRY();
+}
+
+
+/* JsonbFieldExists checks if the given field exists in the given JSONB object. */
+static bool
+JsonbFieldExists(Datum jsonb, const char *fieldName)
+{
+	return DatumGetBool(DirectFunctionCall2(jsonb_exists, jsonb,
+											CStringGetTextDatum(fieldName)));
+}
+
+
+/*
+ * JsonbFieldInt returns integer value of the given field in the given JSONB
+ * object. Caller should have checked that the field exists before calling this
+ * function. If field value cannot be converted to an integer, throws an error.
+ */
+static int
+JsonbFieldInt(Datum jsonb, const char *fieldName)
+{
+	StringInfo fieldStr = JsonbFieldStr(jsonb, fieldName);
+	return pg_atoi(fieldStr->data, fieldStr->len, '\0');
+}
+
+
+/*
+ * JsonbFieldInt returns string value of the given field in the given JSONB
+ * object. Caller should have checked that the field exists before calling this
+ * function.
+ */
+static StringInfo
+JsonbFieldStr(Datum jsonb, const char *fieldName)
+{
+	char *fieldCString = TextDatumGetCString(
+		DirectFunctionCall2(jsonb_object_field_text, jsonb,
+							CStringGetTextDatum(fieldName)));
+	StringInfo fieldStr = makeStringInfo();
+	appendStringInfoString(fieldStr, fieldCString);
+	return fieldStr;
 }
 
 
@@ -160,7 +296,8 @@ NextPow2(uint64 n)
  * the given json object.
  */
 static bool
-SendHttpPostJsonRequest(const char *url, const char *jsonObj, long timeoutSeconds)
+SendHttpPostJsonRequest(const char *url, const char *jsonObj, long timeoutSeconds,
+						curl_write_callback responseCallback)
 {
 	bool success = false;
 	CURLcode curlCode = false;
@@ -175,9 +312,18 @@ SendHttpPostJsonRequest(const char *url, const char *jsonObj, long timeoutSecond
 		headers = curl_slist_append(headers, "charsets: utf-8");
 
 		curl_easy_setopt(curl, CURLOPT_URL, url);
-		curl_easy_setopt(curl, CURLOPT_POSTFIELDS, jsonObj);
 		curl_easy_setopt(curl, CURLOPT_TIMEOUT, timeoutSeconds);
 		curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+
+		if (jsonObj != NULL)
+		{
+			curl_easy_setopt(curl, CURLOPT_POSTFIELDS, jsonObj);
+		}
+
+		if (responseCallback != NULL)
+		{
+			curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, responseCallback);
+		}
 
 		curlCode = curl_easy_perform(curl);
 		if (curlCode == CURLE_OK)

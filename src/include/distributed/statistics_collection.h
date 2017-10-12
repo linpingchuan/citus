@@ -20,6 +20,7 @@ extern bool EnableStatisticsCollection;
 
 extern void WarnIfSyncDNS(void);
 extern bool CollectBasicUsageStatistics(void);
+extern void CheckForUpdates(void);
 
 #endif /* HAVE_LIBCURL */
 

@@ -326,7 +326,9 @@ CitusMaintenanceDaemonMain(Datum main_arg)
 
 				WarnIfSyncDNS();
 				prevStatsCollectionFailed = !CollectBasicUsageStatistics();
+				CheckForUpdates();
 
+				MemoryContextReset(statsCollectionContext);
 				MemoryContextSwitchTo(oldContext);
 				MemoryContextDelete(statsCollectionContext);
 				prevStatsCollection = currentTime;
