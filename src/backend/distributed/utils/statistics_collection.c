@@ -38,8 +38,9 @@ static int JsonbFieldInt(Datum jsonb, const char *fieldName);
 static StringInfo JsonbFieldStr(Datum jsonb, const char *fieldName);
 static uint64 NextPow2(uint64 n);
 static uint64 ClusterSize(List *distributedTableList);
-static bool SendHttpPostJsonRequest(const char *url, const char *postFields, long
-									timeoutSeconds, curl_write_callback responseCallback);
+static bool SendHttpRequest(const char *url, struct curl_slist *headers,
+							const char *postFields, long timeoutSeconds,
+							curl_write_callback responseCallback);
 
 /* WarnIfSyncDNS warns if libcurl is compiled with synchronous DNS. */
 void
@@ -66,10 +67,12 @@ WarnIfSyncDNS(void)
 bool
 CollectBasicUsageStatistics(void)
 {
+	bool success = false;
 	List *distributedTables = NIL;
 	uint64 roundedDistTableCount = 0;
 	uint64 roundedClusterSize = 0;
 	uint32 workerNodeCount = 0;
+	struct curl_slist *headers = NULL;
 	StringInfo fields = makeStringInfo();
 	struct utsname unameData;
 	memset(&unameData, 0, sizeof(unameData));
@@ -96,8 +99,14 @@ CollectBasicUsageStatistics(void)
 	escape_json(fields, unameData.machine);
 	appendStringInfoString(fields, "}");
 
-	return SendHttpPostJsonRequest(STATS_COLLECTION_HOST "/v1/usage_reports",
-								   fields->data, HTTP_TIMEOUT_SECONDS, NULL);
+	headers = curl_slist_append(headers, "Content-Type: application/json");
+	headers = curl_slist_append(headers, "charsets: utf-8");
+	success = SendHttpRequest(STATS_COLLECTION_HOST "/v1/usage_reports",
+							  headers, fields->data, HTTP_TIMEOUT_SECONDS,
+							  NULL /* no callbacks */);
+	curl_slist_free_all(headers);
+
+	return success;
 }
 
 
@@ -105,9 +114,11 @@ CollectBasicUsageStatistics(void)
 void
 CheckForUpdates(void)
 {
-	SendHttpPostJsonRequest(
+	SendHttpRequest(
 		STATS_COLLECTION_HOST "/v1/releases/latest?flavor=community",
-		NULL, HTTP_TIMEOUT_SECONDS, &CheckForUpdatesCallback);
+		NULL /* no headers */,
+		NULL /* this is a GET request, so no POST fields */,
+		HTTP_TIMEOUT_SECONDS, &CheckForUpdatesCallback);
 }
 
 
@@ -289,12 +300,14 @@ NextPow2(uint64 n)
 
 
 /*
- * SendHttpPostJsonRequest sends a HTTP/HTTPS POST request to the given URL with
- * the given json object.
+ * SendHttpRequest sends an HTTP/HTTPS POST/GET request to the given URL with
+ * the given headers and post fields. If postFields is NULL, the request is a
+ * GET request, and otherwise it is a POST request. If responseCallback is not
+ * NULL, it will be called with the contents of the response.
  */
 static bool
-SendHttpPostJsonRequest(const char *url, const char *jsonObj, long timeoutSeconds,
-						curl_write_callback responseCallback)
+SendHttpRequest(const char *url, struct curl_slist *headers, const char *postFields,
+				long timeoutSeconds, curl_write_callback responseCallback)
 {
 	bool success = false;
 	CURLcode curlCode = false;
@@ -304,13 +317,13 @@ SendHttpPostJsonRequest(const char *url, const char *jsonObj, long timeoutSecond
 	curl = curl_easy_init();
 	if (curl)
 	{
-		struct curl_slist *headers = NULL;
-		headers = curl_slist_append(headers, "Content-Type: application/json");
-		headers = curl_slist_append(headers, "charsets: utf-8");
-
 		curl_easy_setopt(curl, CURLOPT_URL, url);
 		curl_easy_setopt(curl, CURLOPT_TIMEOUT, timeoutSeconds);
-		curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+
+		if (headers != NULL)
+		{
+			curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+		}
 
 		if (jsonObj != NULL)
 		{
@@ -344,7 +357,6 @@ SendHttpPostJsonRequest(const char *url, const char *jsonObj, long timeoutSecond
 							  errhint("Error code: %s.", curl_easy_strerror(curlCode))));
 		}
 
-		curl_slist_free_all(headers);
 		curl_easy_cleanup(curl);
 	}
 
