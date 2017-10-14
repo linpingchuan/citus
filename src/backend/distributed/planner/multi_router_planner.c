@@ -1405,15 +1405,16 @@ RouterJob(Query *originalQuery, RelationRestrictionContext *restrictionContext,
 		foreach(relationShardCell, relationShardList)
 		{
 			RelationShard *relationShard = (RelationShard *) lfirst(relationShardCell);
-			Oid relationId = relationShard->relationId;
-			uint64 shardId = relationShard->shardId;
-			StringInfo shardQueryString = makeStringInfo();
+			List *relationShardList = list_make1(relationShard);
+			Query *copiedQuery = copyObject(originalQuery);
 			Task *task = CreateTask(MODIFY_TASK);
+			StringInfo shardQueryString = makeStringInfo();
 
-			deparse_shard_query(originalQuery, relationId, shardId, shardQueryString);
+			UpdateRelationToShardNames((Node *) copiedQuery, relationShardList);
+			pg_get_query_def(copiedQuery, queryString);
 
 			task->taskId = taskId++;
-			task->anchorShardId = shardId;
+			task->anchorShardId = relationShard->shardId;
 			task->queryString = shardQueryString->data;
 
 			taskList = lappend(taskList, task);
@@ -1704,7 +1705,7 @@ PlanRouterQuery(Query *originalQuery, RelationRestrictionContext *restrictionCon
 	 * don't try update shard names, and postpone that to execution phase.
 	 */
 	if (!multiShardQuery && !(UpdateOrDeleteQuery(originalQuery) &&
-		RequiresMasterEvaluation(originalQuery)))
+							  RequiresMasterEvaluation(originalQuery)))
 	{
 		UpdateRelationToShardNames((Node *) originalQuery, *relationShardList);
 	}
